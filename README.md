@@ -1,8 +1,8 @@
-# HTTP API JWT / JWKS cache reproduction
+# HTTP API JWT / JWKS retrieval reproduction
 
-Does API Gateway repeatedly fetch signing keys after successfully validating the
-same token? This experiment records API latency and the actual discovery/JWKS
-requests, without an external identity provider.
+Does API Gateway repeatedly retrieve signing keys while validating an unchanged
+JWT at low request rates? This experiment records retrievals and API latency
+without an external identity provider.
 
 ```text
 local runner -> HTTP API native JWT authorizer -> no-op Lambda
@@ -10,21 +10,17 @@ local runner -> HTTP API native JWT authorizer -> no-op Lambda
                          +-> public discovery/JWKS Lambda URL (logs each request)
 ```
 
-No Okta, Cognito, CloudFront, or Lambda authorizer. The public issuer is only a
-metadata fixture, not a complete OIDC provider. Its application never throttles
-requests, although AWS platform limits still apply.
+The issuer serves fixed metadata and one RSA public key, not a complete OIDC
+service. Both responses advertise `Cache-Control: public, max-age=7200`.
+**Each `/keys` handler deliberately waits 600 ms**; discovery has no added delay.
+This is an experimental delay, not measured Okta latency or throttling. There is
+no application rate limiter, but AWS platform limits still apply.
 
-**Each `/keys` request deliberately waits 600 ms** to make repeated retrievals
-visible in API latency. Discovery has no artificial delay. Issuer logs record
-`artificial_delay_ms`; this is simulated network latency, not a measured Okta delay
-or throttling. Set `JWKS_DELAY_MS = 0` in `lambdas/issuer.py` and redeploy for a
-zero-delay baseline. Redeployment does not flush API Gateway's key cache.
+## Run
 
-## Deploy and run
-
-Requires `uv`, Terraform 1.7+, and AWS sandbox credentials with permission to create
-HTTP APIs, Lambdas/Function URLs, IAM roles/policies, and log groups. Evidence
-collection needs `logs:FilterLogEvents` on the experiment's log groups.
+Requires `uv`, Terraform 1.7+, and sandbox credentials permitted to create HTTP
+APIs, Lambdas/Function URLs, IAM roles/policies, and log groups. Collection requires
+`logs:FilterLogEvents` on the experiment's API and issuer log groups.
 
 From the repository root:
 
@@ -37,183 +33,149 @@ terraform -chdir=infra apply
 uv run python -m repro run
 ```
 
-Default Region: `eu-west-1`. Optional `region` and `name` overrides belong in the
-ignored `infra/terraform.tfvars`.
-
-`prepare` retains a local RSA private key in `.local/signing-key.pem` (0600).
+Default Region: `eu-west-1`. Optional `region` and `name` overrides go in ignored
+`infra/terraform.tfvars`. `prepare` retains `.local/signing-key.pem` locally (0600);
 Terraform reads only the public `.local/jwks.json`. The runner signs and verifies
-one token locally and never prints or saves it. Every request uses that same token.
+one token locally, uses it for every request in the run, and never prints or saves it.
 
-The fixed scenario takes about six minutes:
+One run takes about six minutes and attempts at most 31 API requests:
 
-1. One successful seed request, with no preceding endpoint warm-up.
-2. **240 seconds quiet.**
-3. **30 sequential requests capped at 1 RPS**, with no retries or catch-up bursts.
+1. Send one request, called the **seed**. Stop if it fails.
+2. Send no further requests for 240 seconds.
+3. Send 30 sequential requests, starting at least one second apart. No retries.
 4. Wait 90 seconds, then collect logs.
 
-A failed seed stops the follow-up phase. Requests are saved incrementally, including
-errors. The command exits nonzero for request failures or incomplete API-log
-coverage, not merely for slow successful requests.
+The runner sends no endpoint requests before the seed. API Gateway can fetch
+metadata during deployment; historical logs include these requests. A successful
+seed establishes that request was authorized, not that every validator retained
+the key. The idle interval does not establish cache expiry.
 
-## Read the evidence
+For a zero-delay control, set `JWKS_DELAY_MS = 0` in `lambdas/issuer.py`, apply the
+issuer code change with Terraform, and run again. Keep the API, authorizer, issuer
+URL, and signing key unchanged. Redeployment is not a controlled cache reset.
+No load test or two-hour wait is required by this scenario.
 
-The runner prints its `results/<run>/` directory:
+## Evidence and interpretation
 
-- `manifest.json`: deployment details, scenario, observation window.
-- `client.jsonl`: timestamps, status, latency, API request IDs and Lambda reuse.
-- `collection-window.json`: actual log-query bounds, padded by 60 seconds on each
-  side of the manifest's client observation window to accommodate clock skew.
-- `api-access.json` and `issuer-requests.json`: available logs in that padded window.
-- `correlated.json`: client rows joined to access logs by request ID, including
-  `frontend_ms = responseLatency - integrationLatency`, the API interval and its
-  timestamp source, and issuer requests starting in that interval.
+The runner writes `results/<run>/`:
 
-Look for interleaved large/small frontend times with stable integration latency,
-then compare their timestamps with discovery and `/keys` requests. The backend's
-`boot_id` and increasing `request_count` distinguish process reuse from cold starts.
+- `manifest.json`, `client.jsonl`: deployment, observation window, and every attempt's
+  status, latency, API request ID, and backend process diagnostics.
+- `collection-window.json`: query bounds, padded by 60 seconds on each side of the
+  client window to accommodate clock differences.
+- `api-access.json`, `issuer-requests.json`: available logs in those bounds.
+- `correlated.json`: client attempts joined to API logs by request ID, with
+  `frontend_ms = responseLatency - integrationLatency`.
 
-**Frontend time is not a direct authorizer timer or proof of a cache miss.** Missing
-timing stays unknown. Issuer fetches correlate by time, not by protected API request
-ID; AWS internal traces are needed to establish worker/cache scope and causality.
+A constant backend `boot_id` and increasing `request_count` identify reuse of the
+same Lambda process. **Frontend time is not a direct authorizer timer.** Missing
+or invalid latency remains unknown, not zero.
 
-Logs can arrive late. Recollect with padded bounds without sending more traffic:
+Recollect late logs without API traffic, or summarize saved files offline:
 
 ```bash
 uv run python -m repro collect results/<run>
+uv run python -m analyze results/<run>
 ```
 
-`collect` reports coverage of returned request IDs separately from attempts with
-no HTTP response. A transport error does not count as a missing API log. An HTTP
-response without a request ID does make coverage incomplete. `collect` succeeds
-when at least one ID is returned, all returned IDs are covered, and none of the
-HTTP responses lacks an ID; `run` still exits nonzero for any request failure. Padding is a clock-skew
-allowance, not a guarantee of complete logs.
+`collect` replaces saved log/join files. Coverage requires at least one returned
+API ID, a log for every returned ID, and no HTTP response lacking an ID. Attempts
+without an HTTP response are reported separately. `run` fails on request failures
+or incomplete coverage; `collect` and `analyze` exit based on coverage alone.
+Complete API logs do not guarantee complete issuer logs. Padded queries can also
+include deployment requests or unrelated traffic.
 
-Analyze the saved files offline, without AWS calls or changes to the evidence:
+`analyze` prints coverage, follow-up counts, latency ranges, and timestamp source
+counts without modifying evidence. Successful follow-ups are grouped by whether
+a logged `/keys` request **starts** in `[API start, API start + responseLatency)`:
+start included, end excluded, no tolerance or constraint on handler completion.
+API start uses `$context.requestTimeEpoch`. Older logs without it use the CloudWatch
+event timestamp as an **approximation**, counted under `log_timestamp_ms` in the
+summary. Missing timing goes into `unknown`. No associated fetch means none was
+observed, not that a cache hit is proven. There is no cross-service request-ID
+link; AWS traces are needed to establish causality and cache scope.
 
-```bash
-uv run python -m repro analyze results/<run>
-```
+## Saved results: 2026-09-07
 
-The command prints JSON with coverage, follow-up populations, latency ranges, and
-per-request associations. It exits nonzero for incomplete API-log coverage, not
-for previously recorded request failures, which remain in its output. Redirect
-stdout to a new file if a saved report is needed.
+Four runs in `eu-west-1` use API `4ayx4w0gte` with the same authorizer, issuer URL,
+and signing key. Each run uses one unchanged JWT. Only issuer code changes between
+the zero-delay and 600-ms trials; the API and authorizer are not recreated.
 
-**Association rule:** an issuer request's `started_ms` must fall in the half-open
-interval `[API start, API start + responseLatency)`. Completion need not fall
-inside, and no timing tolerance is applied. The configured access log includes
-`$context.requestTimeEpoch` as the explicit API start after deployment. Historical
-logs without that field use the CloudWatch event timestamp as an **approximate**
-start; each row labels this fallback. Missing or invalid interval timing remains
-unknown, not a no-fetch observation. Absence of an associated fetch means none is
-observed, not that a cache hit is proven.
+Follow-ups only. The last two columns show **request count; frontend range (ms)**,
+using the association rule above:
 
-Even complete API logs do not guarantee complete issuer logs. The padded window
-can include unrelated traffic or deployment prefetch, so total issuer counts are
-not follow-up fetch counts. Inspect the issuer log group separately for prefetch
-outside the padded window. Another run can be warm: a seed or a two-hour wait does
-not prove global cache readiness or a cache flush. This fixture might not reproduce an
-external-provider issue. Preserve fast runs as evidence too.
-
-## Measured results (2026-09-07)
-
-Four runs in `eu-west-1` use the same API (`4ayx4w0gte`), authorizer, issuer URL,
-and signing key. Each run uses one unchanged valid JWT and the fixed scenario
-above. Only the issuer code changes between the zero-delay and 600-ms trials;
-the API and authorizer are not recreated or explicitly flushed.
-
-Follow-ups only, excluding seed requests:
-
-| Run | HTTP 200 / attempts | Associated discovery + JWKS pairs | Frontend with / without temporally associated fetch |
-| --- | ---: | ---: | --- |
-| Baseline 1, no delay | 30/30 | 24 | 30–101 / 3–4 ms |
-| Baseline 2, no delay | 30/30 | 21 | 32–81 / 1–5 ms |
-| Delayed 1, 600 ms | 29/30 | 24 | 633–695 / 3–5 ms |
-| Delayed 2, 600 ms | 30/30 | 21 | 632–670 / 3–5 ms |
-
-The first delayed trial includes one client `ConnectError` with no HTTP response;
-it remains in the evidence, not in the latency populations. The second has no
-request errors. Both delayed trials reuse one backend Lambda environment, with
-10–33 ms integration latency **for follow-ups only**. The first delayed seed has
-381 ms integration latency. All **94 issuer requests** across those trials,
-including seeds, return HTTP 200; issuer Lambda metrics show **zero errors and
-zero throttles**. Each logged `/keys` handler takes 600–601 ms.
-
-The second delayed trial runs at **15:57:45–15:58:15 UTC**. Two adjacent requests:
-
-| API request ID | Response | Integration | Frontend |
+| Trial | 200 / attempts | With fetch | Without fetch |
 | --- | ---: | ---: | ---: |
-| `DVfHQi__joEEPwQ=` | 16 ms | 12 ms | 4 ms |
-| `DVfHagQXDoEEPNw=` | 664 ms | 24 ms | 640 ms |
+| Baseline 1, 0 ms | 30/30 | 24; 30–101 | 6; 3–4 |
+| Baseline 2, 0 ms | 30/30 | 21; 32–81 | 9; 1–5 |
+| Delayed 1, 600 ms | 29/30 | 24; 633–695 | 5; 3–5 |
+| Delayed 2, 600 ms | 30/30 | 21; 632–670 | 9; 3–5 |
 
-The latter's approximate API-side interval contains a `/keys` request at
-**15:57:47.817–15:57:48.417 UTC**, returning 200 with `artificial_delay_ms = 600`.
-The former has no issuer request in its interval. These are timestamp associations,
-not a propagated cross-service request ID. All four historical runs use the
-CloudWatch-timestamp fallback described above. In delayed run 1, the `/keys`
-request associated with `DVeMpjlCjoEEPJQ=` starts inside its approximate interval
-but finishes 28 ms after it ends. The start-based rule includes it; strict
-completion containment would not. This discrepancy reinforces that these clocks
-and inferred intervals cannot establish exact cross-service causality.
+Delayed 1 includes one `ConnectError` without an HTTP response, excluded from latency
+groups but retained as an attempt. Delayed 2 has no request errors. The delayed
+follow-ups reuse one backend process, with 10–33 ms integration latency (the first
+delayed seed is 381 ms). All 94 logged issuer requests across those trials, including
+seeds, return 200. Saved issuer Lambda metrics show zero errors and throttles;
+each logged `/keys` handler takes 600–601 ms.
 
-**Repeated retrievals occur without Okta or observed throttling.** Adding 600 ms
-makes their cost visible on later successful validations, while the fast path
-remains a few milliseconds. The delay is intentional; it does not prove the cause
-of Okta's original latency or establish API Gateway's internal cache scope.
+Two adjacent requests in delayed 2, **15:57:45–15:58:15 UTC**:
 
-Delayed evidence is saved locally in `results/1788796033007811000/` and
-`results/1788796424241067000/`, including `correlated-wide.json` and
-`analysis-summary.json`. These Git-ignored artifacts are not published here.
-For these results, additional read-only log queries widen the original window by
-60 seconds on each side, recovering all 61 HTTP-response request IDs. The original
-collector uses exact client-clock bounds and clips the final API record in both
-baseline runs. The current collector applies this padding automatically, including
-when recollecting an old manifest; previously saved artifacts remain unchanged.
+| API request ID | Response ms | Integration ms | Frontend ms |
+| --- | ---: | ---: | ---: |
+| `DVfHQi__joEEPwQ=` | 16 | 12 | 4 |
+| `DVfHagQXDoEEPNw=` | 664 | 24 | 640 |
 
-Reproduce the table from the saved historical widened exports, without querying
-AWS or overwriting the original analysis:
+The latter's approximate interval contains a `/keys` handler at
+**15:57:47.817–15:57:48.417 UTC**, returning 200 after the injected 600 ms. No issuer
+request is observed in the former's interval. All historical runs use approximate
+API start times. In delayed 1, the handler associated with `DVeMpjlCjoEEPJQ=` starts
+inside but finishes 28 ms beyond its interval: included by the start-based rule,
+not by strict completion containment.
+
+**Repeated retrievals occur without Okta or observed issuer throttling.** Associated
+frontend times increase with the injected delay; the other requests remain at a
+few milliseconds. This does not explain the original Okta latency or prove a cache
+defect. [AWS documents](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html)
+that keys *can* be cached for two hours, not a guaranteed single shared cache
+populated by one successful validation.
+
+Recalculate from local historical exports without AWS calls:
 
 ```bash
 for run in 1788794585336770000 1788795026008704000 1788796033007811000 1788796424241067000; do
-  uv run python -m repro analyze "results/$run" --wide
+  uv run python -m analyze "results/$run" --wide
 done
 ```
 
-`--wide` explicitly selects `api-access-wide.json` and `issuer-requests-wide.json`;
-there is no automatic fallback between old and new evidence files. Both raw
-CloudWatch exports and the runner's normalized JSON format are supported.
+`--wide` reads `api-access-wide.json` and `issuer-requests-wide.json`, accepting raw
+CloudWatch or normalized JSON. Those queries use ±60-second padding; the original
+exact client-clock bounds omit the last API record in both baseline runs. The
+current collector pads automatically. Existing exports remain unchanged.
 
-For AWS Support, attach `results/aws-support-request-ids-20260907.txt` as well as
-linking the repository. This local export includes all 154 API request IDs from
-the four standalone runs and the earlier Okta-backed probe, plus 190 issuer Lambda
-request IDs in a separate section. It labels timestamp sources and the artificial
-delay. API and issuer IDs are different namespaces. The repository link alone does
-not provide these Git-ignored results; review attachments before sharing.
+Results are Git-ignored. For AWS Support, attach the locally saved
+`results/aws-support-request-ids-20260907.txt`: 154 API IDs from these runs and the
+earlier Okta probe, plus 190 issuer Lambda IDs in a separate section. It labels
+timestamp sources and injected delay. These are different ID namespaces; the
+repository link alone does not include the evidence.
 
-## Local checks and cleanup
+## Checks and cleanup
 
-Three offline checks cover token/key consistency, discovery/JWKS responses, and
-frontend-time calculation:
+Offline tests cover keys/tokens, metadata responses, latency, log formats,
+timestamp selection, interval boundaries, and coverage:
 
 ```bash
 uv run python -m unittest discover -s tests -v
 terraform -chdir=infra validate
 ```
 
-The public endpoints are billable. API Gateway has a 10-RPS stage throttle, which
-is not a cost cap. Use an isolated sandbox and destroy it when finished:
+The public endpoints are billable. API Gateway's 10-RPS throttle is not a cost cap
+and does not limit direct issuer requests. Export evidence before cleanup, which
+also deletes the log groups:
 
 ```bash
 terraform -chdir=infra destroy
 ```
 
-Export evidence first: destruction also deletes the log groups. Keep Terraform
-state until cleanup completes. Keys, state, plans, variable files, generated ZIPs,
-and results are Git-ignored. Review exact staged files before publishing; evidence
-contains deployed identifiers even though it excludes tokens. Keep private keys
-local, including when choosing a Terraform execution environment.
-
-Reference: [AWS JWT authorizer documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-jwt-authorizer.html)
-says API Gateway **can** cache public keys for two hours; it does not define a
-single shared cache or guarantee that one seed warms all validators.
+Retain state until destruction completes. Private keys, state, plans, variables,
+ZIPs, and results are Git-ignored. Keep private keys local; review staged files and
+attachments before sharing. Evidence includes deployed identifiers, not tokens.
