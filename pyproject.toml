@@ -1,0 +1,9 @@
+[project]
+name = "apigateway-http-api-jwks-cache-repro"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.40,<2",
+  "httpx>=0.28,<0.29",
+  "pyjwt[crypto]>=2.10,<3",
+]
