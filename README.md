@@ -61,9 +61,12 @@ The runner prints its `results/<run>/` directory:
 
 - `manifest.json`: deployment details, scenario, observation window.
 - `client.jsonl`: timestamps, status, latency, API request IDs and Lambda reuse.
-- `api-access.json` and `issuer-requests.json`: available logs in that window.
+- `collection-window.json`: actual log-query bounds, padded by 60 seconds on each
+  side of the manifest's client observation window to accommodate clock skew.
+- `api-access.json` and `issuer-requests.json`: available logs in that padded window.
 - `correlated.json`: client rows joined to access logs by request ID, including
-  `frontend_ms = responseLatency - integrationLatency`.
+  `frontend_ms = responseLatency - integrationLatency`, the API interval and its
+  timestamp source, and issuer requests starting in that interval.
 
 Look for interleaved large/small frontend times with stable integration latency,
 then compare their timestamps with discovery and `/keys` requests. The backend's
@@ -73,16 +76,44 @@ then compare their timestamps with discovery and `/keys` requests. The backend's
 timing stays unknown. Issuer fetches correlate by time, not by protected API request
 ID; AWS internal traces are needed to establish worker/cache scope and causality.
 
-Logs can arrive late. Recollect for the same window without sending more traffic:
+Logs can arrive late. Recollect with padded bounds without sending more traffic:
 
 ```bash
 uv run python -m repro collect results/<run>
 ```
 
-Even complete API logs do not guarantee complete issuer logs. Prefetch during
-Terraform deployment is outside the run window; inspect the issuer log group
-separately for that. Another run can be warm: a seed or a two-hour wait does not
-prove global cache readiness or a cache flush. This fixture might not reproduce an
+`collect` reports coverage of returned request IDs separately from attempts with
+no HTTP response. A transport error does not count as a missing API log. An HTTP
+response without a request ID does make coverage incomplete. `collect` succeeds
+when at least one ID is returned, all returned IDs are covered, and none of the
+HTTP responses lacks an ID; `run` still exits nonzero for any request failure. Padding is a clock-skew
+allowance, not a guarantee of complete logs.
+
+Analyze the saved files offline, without AWS calls or changes to the evidence:
+
+```bash
+uv run python -m repro analyze results/<run>
+```
+
+The command prints JSON with coverage, follow-up populations, latency ranges, and
+per-request associations. It exits nonzero for incomplete API-log coverage, not
+for previously recorded request failures, which remain in its output. Redirect
+stdout to a new file if a saved report is needed.
+
+**Association rule:** an issuer request's `started_ms` must fall in the half-open
+interval `[API start, API start + responseLatency)`. Completion need not fall
+inside, and no timing tolerance is applied. The configured access log includes
+`$context.requestTimeEpoch` as the explicit API start after deployment. Historical
+logs without that field use the CloudWatch event timestamp as an **approximate**
+start; each row labels this fallback. Missing or invalid interval timing remains
+unknown, not a no-fetch observation. Absence of an associated fetch means none is
+observed, not that a cache hit is proven.
+
+Even complete API logs do not guarantee complete issuer logs. The padded window
+can include unrelated traffic or deployment prefetch, so total issuer counts are
+not follow-up fetch counts. Inspect the issuer log group separately for prefetch
+outside the padded window. Another run can be warm: a seed or a two-hour wait does
+not prove global cache readiness or a cache flush. This fixture might not reproduce an
 external-provider issue. Preserve fast runs as evidence too.
 
 ## Measured results (2026-09-07)
@@ -94,7 +125,7 @@ the API and authorizer are not recreated or explicitly flushed.
 
 Follow-ups only, excluding seed requests:
 
-| Run | HTTP 200 / attempts | Discovery + JWKS pairs | Frontend with fetch / without fetch |
+| Run | HTTP 200 / attempts | Associated discovery + JWKS pairs | Frontend with / without temporally associated fetch |
 | --- | ---: | ---: | --- |
 | Baseline 1, no delay | 30/30 | 24 | 30–101 / 3–4 ms |
 | Baseline 2, no delay | 30/30 | 21 | 32–81 / 1–5 ms |
@@ -104,7 +135,8 @@ Follow-ups only, excluding seed requests:
 The first delayed trial includes one client `ConnectError` with no HTTP response;
 it remains in the evidence, not in the latency populations. The second has no
 request errors. Both delayed trials reuse one backend Lambda environment, with
-10–33 ms integration latency. All **94 issuer requests** across those trials,
+10–33 ms integration latency **for follow-ups only**. The first delayed seed has
+381 ms integration latency. All **94 issuer requests** across those trials,
 including seeds, return HTTP 200; issuer Lambda metrics show **zero errors and
 zero throttles**. Each logged `/keys` handler takes 600–601 ms.
 
@@ -115,10 +147,15 @@ The second delayed trial runs at **15:57:45–15:58:15 UTC**. Two adjacent reque
 | `DVfHQi__joEEPwQ=` | 16 ms | 12 ms | 4 ms |
 | `DVfHagQXDoEEPNw=` | 664 ms | 24 ms | 640 ms |
 
-The latter's API-side interval contains a `/keys` request at
+The latter's approximate API-side interval contains a `/keys` request at
 **15:57:47.817–15:57:48.417 UTC**, returning 200 with `artificial_delay_ms = 600`.
 The former has no issuer request in its interval. These are timestamp associations,
-not a propagated cross-service request ID.
+not a propagated cross-service request ID. All four historical runs use the
+CloudWatch-timestamp fallback described above. In delayed run 1, the `/keys`
+request associated with `DVeMpjlCjoEEPJQ=` starts inside its approximate interval
+but finishes 28 ms after it ends. The start-based rule includes it; strict
+completion containment would not. This discrepancy reinforces that these clocks
+and inferred intervals cannot establish exact cross-service causality.
 
 **Repeated retrievals occur without Okta or observed throttling.** Adding 600 ms
 makes their cost visible on later successful validations, while the fast path
@@ -129,9 +166,30 @@ Delayed evidence is saved locally in `results/1788796033007811000/` and
 `results/1788796424241067000/`, including `correlated-wide.json` and
 `analysis-summary.json`. These Git-ignored artifacts are not published here.
 For these results, additional read-only log queries widen the original window by
-60 seconds on each side, recovering all 61 HTTP-response request IDs. The runner's
-exact client-clock cutoff can otherwise clip trailing AWS records; waiting longer
-or rerunning `collect` with the same bounds does not fix that clipping.
+60 seconds on each side, recovering all 61 HTTP-response request IDs. The original
+collector uses exact client-clock bounds and clips the final API record in both
+baseline runs. The current collector applies this padding automatically, including
+when recollecting an old manifest; previously saved artifacts remain unchanged.
+
+Reproduce the table from the saved historical widened exports, without querying
+AWS or overwriting the original analysis:
+
+```bash
+for run in 1788794585336770000 1788795026008704000 1788796033007811000 1788796424241067000; do
+  uv run python -m repro analyze "results/$run" --wide
+done
+```
+
+`--wide` explicitly selects `api-access-wide.json` and `issuer-requests-wide.json`;
+there is no automatic fallback between old and new evidence files. Both raw
+CloudWatch exports and the runner's normalized JSON format are supported.
+
+For AWS Support, attach `results/aws-support-request-ids-20260907.txt` as well as
+linking the repository. This local export includes all 154 API request IDs from
+the four standalone runs and the earlier Okta-backed probe, plus 190 issuer Lambda
+request IDs in a separate section. It labels timestamp sources and the artificial
+delay. API and issuer IDs are different namespaces. The repository link alone does
+not provide these Git-ignored results; review attachments before sharing.
 
 ## Local checks and cleanup
 

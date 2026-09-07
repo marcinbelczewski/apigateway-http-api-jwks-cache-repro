@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 ROOT = Path(__file__).resolve().parent
 KEY = ROOT / ".local/signing-key.pem"
 JWKS = ROOT / ".local/jwks.json"
+LOG_PADDING_MS = 60_000
 
 
 def save(path, value):
@@ -98,11 +99,141 @@ def frontend(event):
     return None
 
 
+def normalize_events(entries):
+    """Accept both runner JSON and raw CloudWatch FilterLogEvents exports."""
+    events = []
+    for entry in entries:
+        if "message" in entry:
+            try:
+                event = json.loads(entry["message"])
+            except (ValueError, TypeError):
+                continue  # Lambda START/END/REPORT lines are not application JSON.
+            if isinstance(event, dict):
+                events.append({**event, "log_timestamp_ms": entry["timestamp"]})
+        elif isinstance(entry, dict):
+            events.append(entry)
+    return events
+
+
+def api_interval(event):
+    """Legacy event timestamps are an explicitly labelled start-time approximation."""
+    if not event:
+        return None
+    try:
+        duration = int(event["responseLatency"])
+        source = "requestTimeEpoch"
+        if source not in event:  # Historical logs predate explicit request-start logging.
+            source = "log_timestamp_ms"
+        start = int(event[source])
+        if start >= 0 and duration >= 0:
+            return {"start_ms": start, "end_ms": start + duration, "source": source}
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def correlate(rows, access, issuer):
+    by_id = {event["requestId"]: event for event in access if event.get("requestId")}
+    correlated = []
+    for original in rows:
+        row = dict(original)
+        row["access_log"] = by_id.get(row.get("request_id"))
+        row["frontend_ms"] = frontend(row["access_log"])
+        interval = api_interval(row["access_log"])
+        row["api_interval"] = interval
+        # Fetch START must fall in [API start, API start + responseLatency).
+        # Completion need not be contained; no clock tolerance is silently applied.
+        row["issuer_events_starting_in_api_interval"] = None if interval is None else [
+            event for event in issuer
+            if isinstance(event.get("started_ms"), (int, float))
+            and interval["start_ms"] <= event["started_ms"] < interval["end_ms"]
+        ]
+        correlated.append(row)
+    return correlated
+
+
+def coverage(rows):
+    responses = [row for row in rows if row.get("status") is not None]
+    expected = [row for row in rows if row.get("request_id")]
+    matched = sum(row["access_log"] is not None for row in expected)
+    missing_ids = sum(not row.get("request_id") for row in responses)
+    return {
+        "attempts": len(rows),
+        "http_responses": len(responses),
+        "attempts_without_http_response": len(rows) - len(responses),
+        "request_ids": len(expected),
+        "matched_request_ids": matched,
+        "responses_without_request_id": missing_ids,
+        "complete": bool(expected) and matched == len(expected) and missing_ids == 0,
+    }
+
+
+def analyze(directory, wide=False):
+    """Analyze saved evidence only; print JSON without modifying the run directory."""
+    suffix = "-wide" if wide else ""
+    paths = {
+        name: directory / f"{name}{suffix}.json"
+        for name in ("api-access", "issuer-requests")
+    }
+    streams = {
+        name: normalize_events(json.loads(path.read_text())) for name, path in paths.items()
+    }
+    clients = [json.loads(line) for line in (directory / "client.jsonl").read_text().splitlines()]
+    rows = correlate(clients, streams["api-access"], streams["issuer-requests"])
+    populations = {
+        name: [] for name in ("with_associated_jwks", "without_associated_jwks", "unknown")
+    }
+    for row in rows:
+        if row["index"] == 0 or row.get("status") != 200 or "error" in row:
+            continue
+        events = row["issuer_events_starting_in_api_interval"]
+        if events is None or row["frontend_ms"] is None:
+            population = "unknown"
+        else:
+            has_keys = any(event.get("path") == "/keys" for event in events)
+            population = "with_associated_jwks" if has_keys else "without_associated_jwks"
+        populations[population].append(row)
+    summary = {}
+    for name, population in populations.items():
+        timings = [row["frontend_ms"] for row in population if row["frontend_ms"] is not None]
+        summary[name] = {
+            "count": len(population),
+            "frontend_ms_range": [min(timings), max(timings)] if timings else None,
+        }
+    report = {
+        "run": directory.name,
+        "inputs": {name: str(path) for name, path in paths.items()},
+        "coverage": coverage(rows),
+        "association_rule": (
+            "Issuer start in [API start, API start + responseLatency); "
+            "no tolerance; completion may fall outside."
+        ),
+        "legacy_clock_caveat": (
+            "Missing requestTimeEpoch falls back to CloudWatch event timestamp, "
+            "an approximate API start. No cross-service request-ID linkage."
+        ),
+        "issuer_coverage_caveat": (
+            "No associated fetch means none observed, not proof of a cache hit. "
+            "Padded logs may contain unrelated traffic or deployment prefetch."
+        ),
+        "successful_followups": summary,
+        "rows": rows,
+    }
+    print(json.dumps(report, indent=2))
+    return report["coverage"]["complete"]
+
+
 def collect(directory):
     manifest = json.loads((directory / "manifest.json").read_text())
     config = manifest["deployment"]
     logs = boto3.client("logs", region_name=config["region"])
     streams = {}
+    window = {
+        "started_ms": max(0, manifest["started_ms"] - LOG_PADDING_MS),
+        "ended_ms": manifest["ended_ms"] + LOG_PADDING_MS,
+        "padding_ms": LOG_PADDING_MS,
+    }
+    save(directory / "collection-window.json", window)
     for name, group in (
         ("api-access", "access_log_group"),
         ("issuer-requests", "issuer_log_group"),
@@ -110,33 +241,30 @@ def collect(directory):
         events = []
         for page in logs.get_paginator("filter_log_events").paginate(
             logGroupName=config[group],
-            startTime=manifest["started_ms"],
-            endTime=manifest["ended_ms"],
+            startTime=window["started_ms"],
+            endTime=window["ended_ms"],
         ):
-            for entry in page.get("events", []):
-                try:
-                    event = json.loads(entry["message"])
-                    events.append({**event, "log_timestamp_ms": entry["timestamp"]})
-                except (ValueError, TypeError):
-                    pass  # Ignore Lambda START/END/REPORT lines.
+            events.extend(normalize_events(page.get("events", [])))
         save(directory / f"{name}.json", events)
         streams[name] = events
-    by_id = {event["requestId"]: event for event in streams["api-access"]}
-    rows = [json.loads(line) for line in (directory / "client.jsonl").read_text().splitlines()]
-    for row in rows:
-        row["access_log"] = by_id.get(row.get("request_id"))
-        row["frontend_ms"] = frontend(row["access_log"])
+    clients = [json.loads(line) for line in (directory / "client.jsonl").read_text().splitlines()]
+    rows = correlate(clients, streams["api-access"], streams["issuer-requests"])
     save(directory / "correlated.json", rows)
-    matched = sum(row["access_log"] is not None for row in rows)
+    log_coverage = coverage(rows)
     followups = [row for row in rows if row["index"] > 0]
     slow = sum(row["frontend_ms"] is not None and row["frontend_ms"] >= 400 for row in followups)
     print(
-        f"API logs: {matched}/{len(rows)} matched; follow-ups >=400ms: {slow}/{len(followups)}"
+        f"API logs: {log_coverage['matched_request_ids']}/{log_coverage['request_ids']} request IDs matched; "
+        f"follow-ups >=400ms: {slow}/{len(followups)}"
+    )
+    print(
+        f"Attempts without HTTP response: {log_coverage['attempts_without_http_response']}; "
+        f"HTTP responses without request ID: {log_coverage['responses_without_request_id']}"
     )
     print(
         f"Issuer requests: {len(streams['issuer-requests'])}; compare timestamps, not just counts."
     )
-    return bool(rows) and matched == len(rows)
+    return log_coverage["complete"]
 
 
 def run():
@@ -203,14 +331,19 @@ def run():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["prepare", "run", "collect"])
+    parser.add_argument("command", choices=["prepare", "run", "collect", "analyze"])
     parser.add_argument(
-        "directory", nargs="?", type=Path, help="Existing run directory for collect"
+        "directory", nargs="?", type=Path, help="Existing run directory for collect/analyze"
     )
+    parser.add_argument("--wide", action="store_true", help="Analyze historical *-wide.json exports")
     args = parser.parse_args()
-    if args.command == "collect" and args.directory is None:
-        parser.error("collect requires a run directory")
+    if args.command in ("collect", "analyze") and args.directory is None:
+        parser.error(f"{args.command} requires a run directory")
+    if args.wide and args.command != "analyze":
+        parser.error("--wide is only valid with analyze")
     if args.command == "prepare":
         prepare()
+    elif args.command == "analyze":
+        raise SystemExit(int(not analyze(args.directory, wide=args.wide)))
     else:
         raise SystemExit(run() if args.command == "run" else int(not collect(args.directory)))
