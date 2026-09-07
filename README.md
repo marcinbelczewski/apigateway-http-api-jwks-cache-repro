@@ -10,9 +10,15 @@ local runner -> HTTP API native JWT authorizer -> no-op Lambda
                          +-> public discovery/JWKS Lambda URL (logs each request)
 ```
 
-No Okta, Cognito, CloudFront, Lambda authorizer, or artificial latency. The public
-issuer is only a metadata fixture, not a complete OIDC provider. Its application
-never throttles requests, although AWS platform limits still apply.
+No Okta, Cognito, CloudFront, or Lambda authorizer. The public issuer is only a
+metadata fixture, not a complete OIDC provider. Its application never throttles
+requests, although AWS platform limits still apply.
+
+**Each `/keys` request deliberately waits 600 ms** to make repeated retrievals
+visible in API latency. Discovery has no artificial delay. Issuer logs record
+`artificial_delay_ms`; this is simulated network latency, not a measured Okta delay
+or throttling. Set `JWKS_DELAY_MS = 0` in `lambdas/issuer.py` and redeploy for a
+zero-delay baseline. Redeployment does not flush API Gateway's key cache.
 
 ## Deploy and run
 
@@ -78,6 +84,54 @@ Terraform deployment is outside the run window; inspect the issuer log group
 separately for that. Another run can be warm: a seed or a two-hour wait does not
 prove global cache readiness or a cache flush. This fixture might not reproduce an
 external-provider issue. Preserve fast runs as evidence too.
+
+## Measured results (2026-09-07)
+
+Four runs in `eu-west-1` use the same API (`4ayx4w0gte`), authorizer, issuer URL,
+and signing key. Each run uses one unchanged valid JWT and the fixed scenario
+above. Only the issuer code changes between the zero-delay and 600-ms trials;
+the API and authorizer are not recreated or explicitly flushed.
+
+Follow-ups only, excluding seed requests:
+
+| Run | HTTP 200 / attempts | Discovery + JWKS pairs | Frontend with fetch / without fetch |
+| --- | ---: | ---: | --- |
+| Baseline 1, no delay | 30/30 | 24 | 30–101 / 3–4 ms |
+| Baseline 2, no delay | 30/30 | 21 | 32–81 / 1–5 ms |
+| Delayed 1, 600 ms | 29/30 | 24 | 633–695 / 3–5 ms |
+| Delayed 2, 600 ms | 30/30 | 21 | 632–670 / 3–5 ms |
+
+The first delayed trial includes one client `ConnectError` with no HTTP response;
+it remains in the evidence, not in the latency populations. The second has no
+request errors. Both delayed trials reuse one backend Lambda environment, with
+10–33 ms integration latency. All **94 issuer requests** across those trials,
+including seeds, return HTTP 200; issuer Lambda metrics show **zero errors and
+zero throttles**. Each logged `/keys` handler takes 600–601 ms.
+
+The second delayed trial runs at **15:57:45–15:58:15 UTC**. Two adjacent requests:
+
+| API request ID | Response | Integration | Frontend |
+| --- | ---: | ---: | ---: |
+| `DVfHQi__joEEPwQ=` | 16 ms | 12 ms | 4 ms |
+| `DVfHagQXDoEEPNw=` | 664 ms | 24 ms | 640 ms |
+
+The latter's API-side interval contains a `/keys` request at
+**15:57:47.817–15:57:48.417 UTC**, returning 200 with `artificial_delay_ms = 600`.
+The former has no issuer request in its interval. These are timestamp associations,
+not a propagated cross-service request ID.
+
+**Repeated retrievals occur without Okta or observed throttling.** Adding 600 ms
+makes their cost visible on later successful validations, while the fast path
+remains a few milliseconds. The delay is intentional; it does not prove the cause
+of Okta's original latency or establish API Gateway's internal cache scope.
+
+Delayed evidence is saved locally in `results/1788796033007811000/` and
+`results/1788796424241067000/`, including `correlated-wide.json` and
+`analysis-summary.json`. These Git-ignored artifacts are not published here.
+For these results, additional read-only log queries widen the original window by
+60 seconds on each side, recovering all 61 HTTP-response request IDs. The runner's
+exact client-clock cutoff can otherwise clip trailing AWS records; waiting longer
+or rerunning `collect` with the same bounds does not fix that clipping.
 
 ## Local checks and cleanup
 
